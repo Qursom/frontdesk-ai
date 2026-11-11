@@ -1,0 +1,61 @@
+{
+  "slug": "bright-smile",
+  "name": "Bright Smile Dental",
+  "botName": "Sophie",
+  "defaultLanguage": "en",
+  "phone": "020 7946 0321",
+  "emergencyInfo": "If you have severe swelling, difficulty breathing or swallowing, or heavy bleeding that will not stop, call 999 or go to A&E. Out of hours you can call NHS 111.",
+  "welcomeMessage": "Hi, I'm Sophie 👋 I'm an AI assistant for Bright Smile Dental, not a person. I can help with prices, opening times and appointment requests. For medical advice, our team will help.",
+  "quickReplies": [
+    "Book an appointment",
+    "Prices",
+    "I'm in pain",
+    "Talk to the team"
+  ],
+  "theme": {
+    "primaryColor": "#0F766E",
+    "radius": 20
+  },
+  "allowedDomains": [],
+  "handoffEmail": "wandertech58@gmail.com",
+  "privacyUrl": "/#privacy",
+  "extraRules": "- Always mention that prices are a guide and the final price is confirmed after an examination when talking about treatment prices.\n- Prices are in British pounds (GBP).",
+  "features": {
+    "booking": false,
+    "whatsapp": false
+  },
+  "active": true,
+  "timezone": "Europe/London",
+  "openingHours": [
+    {
+      "day": 1,
+      "open": "08:30",
+      "close": "18:00"
+    },
+    {
+      "day": 2,
+      "open": "08:30",
+      "close": "18:00"
+    },
+    {
+      "day": 3,
+      "open": "08:30",
+      "close": "19:30"
+    },
+    {
+      "day": 4,
+      "open": "08:30",
+      "close": "18:00"
+    },
+    {
+      "day": 5,
+      "open": "08:30",
+      "close": "17:00"
+    },
+    {
+      "day": 6,
+      "open": "09:00",
+      "close": "13:00"
+    }
+  ]
+}

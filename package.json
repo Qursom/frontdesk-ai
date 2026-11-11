@@ -1,0 +1,22 @@
+{
+  "name": "frontdesk-ai",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI front desk for clinics - Phase 1 (website chat demo). NestJS API + Next.js web.",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "seed": "npm run seed -w apps/api",
+    "index:create": "npm run index:create -w apps/api",
+    "ingest": "npm run ingest -w apps/api",
+    "eval": "npm run eval -w apps/api",
+    "test": "npm run test -w apps/api",
+    "build": "npm run build -w apps/api && npm run build -w apps/web"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

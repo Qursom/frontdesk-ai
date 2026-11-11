@@ -1,0 +1,55 @@
+/* Design tokens. Source of truth: docs/UI-GUIDE.md section 1. Colours are WCAG AA checked there. */
+:root {
+  /* colours */
+  --color-primary: #0F766E;
+  --color-primary-hover: #115E59;
+  --color-primary-soft: #F0FDFA;
+  --color-ink: #0F172A;
+  --color-ink-muted: #475569;
+  --color-surface: #FFFFFF;
+  --color-warm: #FAF7F2;
+  --color-accent: #B45309;
+  --color-border: #E2E8F0;       /* decorative dividers only, too light for controls */
+  --color-input-border: #64748B; /* controls need >= 3:1 */
+  --color-success: #15803D;
+  --color-danger: #B91C1C;
+  --color-focus: #1D4ED8;
+
+  /* type: --font-fraunces / --font-inter are set by next/font in layout.tsx */
+  --font-heading: var(--font-fraunces), Georgia, serif;
+  --font-body: var(--font-inter), system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+  --text-2xl: 28px;
+  --text-3xl: 36px;
+  --text-4xl: 48px;
+
+  /* spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 72px;
+
+  /* shape */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-pill: 999px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, .06);
+  --shadow-md: 0 6px 20px rgba(15, 23, 42, .08);
+  --shadow-lg: 0 18px 48px rgba(15, 23, 42, .16);
+
+  /* motion */
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --dur: 200ms;
+
+  /* layout */
+  --container: 1160px;
+  --header-h: 72px;
+}

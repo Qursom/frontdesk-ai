@@ -1,0 +1,529 @@
+=====================================================================
+ FRONTDESK AI - PROJECT GUIDE
+ How the project is built, why, the full flow, and the technical details
+=====================================================================
+
+Note: this guide describes the codebase as it exists in this folder.
+It was written by reading the source code and CLAUDE.md. It explains
+each design decision and the reason behind it.
+
+CONTENTS
+  1. What the project is
+  2. The approach and why each choice was made
+  3. Architecture at a glance
+  4. The full flow of one chat message
+  5. The offline data pipeline (seed, index, ingest)
+  6. Technical implementation, module by module
+  7. Data model
+  8. API endpoints
+  9. Security and compliance
+ 10. Testing
+ 11. Local setup notes (lessons from getting it running)
+ 12. How to extend it
+
+
+---------------------------------------------------------------------
+1. WHAT THE PROJECT IS
+---------------------------------------------------------------------
+
+FrontDesk AI is an AI front-desk assistant for clinics, starting with
+dental clinics in the UK and EU. A clinic adds one script tag to its
+website, and a chat bubble appears. The assistant:
+
+  - answers questions using only the clinic's own information,
+  - collects contact details ("leads") from people who want a visit,
+  - hands urgent cases and "I want a human" requests to staff,
+  - always says clearly that it is an AI.
+
+Phase 1, which is what exists now, is website chat only.
+The demo clinic is "Bright Smile Dental" (fictional), tenant slug
+"bright-smile".
+
+Later phases, not built yet: WhatsApp, calendar booking, voice,
+multi-user admin.
+
+
+---------------------------------------------------------------------
+2. THE APPROACH AND WHY EACH CHOICE WAS MADE
+---------------------------------------------------------------------
+
+2.1 Modular monolith in one repository
+    What: one repo with npm workspaces. apps/api is the backend
+    (NestJS 11, TypeScript). apps/web is the frontend (Next.js 15,
+    React 19). No microservices, queues, Redis or Docker.
+    Why: one developer can run, understand and deploy it. The API goes
+    to Render and the web app to Vercel, both with free tiers.
+    NestJS modules keep features separated, so parts can be split out
+    later if ever needed.
+
+2.2 "Channel is not the brain"
+    What: the HTTP controller for chat is a thin adapter. All decision
+    logic lives in ChatService and AgentService.
+    Why: in Phase 2 a WhatsApp adapter will call the same
+    ChatService.handle() with channel "whatsapp". The bot behaves the
+    same on every channel, and logic is never copied.
+
+2.3 Multi-tenant from day one
+    What: every database document has a tenantId, and every query
+    filters by it. That includes the vector search, and the lookup of
+    an existing conversation.
+    Why: selling to many clinics means one clinic must never see
+    another clinic's data or answers. Building this in from the start
+    is much cheaper than adding it later.
+
+2.4 Configuration, not code
+    What: everything clinic-specific (name, bot name, phone, welcome
+    message, colours, allowed websites, extra prompt rules) lives in
+    data/tenants/<slug>/tenant.json, which becomes a Tenant document.
+    Why: adding clinic number two means adding a folder and running two
+    commands. No code change, no redeploy of logic.
+
+2.5 Vendors behind interfaces
+    What: only the providers/ folder talks to Google Gemini. Business
+    code asks for an "LLM provider" and an "embedding provider" through
+    injection tokens (LLM_PROVIDER, EMBEDDING_PROVIDER).
+    Why: the free Gemini tier is fine for a demo with fictional data,
+    but real patient data needs a paid EU provider. Swapping means
+    writing one new provider class, not touching the chat logic.
+
+2.6 Safety in code, not only in the prompt
+    What: before the AI is called, guardrails.ts checks the message
+    with fixed patterns. Emergencies (swelling, heavy bleeding, broken
+    tooth, can't breathe) and requests for a human get a fixed, safe
+    reply and are handed to staff.
+    Why: AI models can ignore instructions. Anything that could hurt a
+    patient must be handled by predictable code. It is also faster and
+    costs nothing, because no AI call is made.
+
+2.7 RAG instead of training a model
+    What: the clinic's information is written in Markdown files. They
+    are split into chunks, turned into vectors ("embeddings"), and
+    stored in MongoDB. For each question, the closest chunks are found
+    and given to the AI with a strict rule: answer only from these.
+    RAG means "retrieval-augmented generation".
+    Why: it is cheap, it updates instantly when the clinic text
+    changes, and it stops the bot from inventing prices. The answer
+    can also name its sources.
+
+2.8 MongoDB Atlas for everything
+    What: one database stores tenants, chat history, leads and the
+    vectors. Atlas Vector Search does the similarity search.
+    Why: one service instead of a database plus a separate vector
+    store. The free M0 tier is enough for the demo. TTL indexes delete
+    old data automatically, which helps with GDPR.
+
+2.9 Widget in an iframe, loaded by a small script
+    What: the clinic site loads public/loader.js. It draws a bubble
+    and opens an iframe pointing to our /embed page.
+    Why: it works on any website (WordPress, Wix, plain HTML). The
+    clinic's CSS cannot break the widget, and ours cannot break their
+    site. Which sites may embed it is controlled per tenant.
+
+2.10 The AI answers in JSON with an "action"
+    What: the model returns {reply, action, usedSources}. The action
+    tells the widget what to do next: NONE, SHOW_LEAD_FORM or HANDOFF.
+    Why: the widget's behaviour is driven by data, not guesswork. New
+    behaviour in later phases (for example SHOW_BOOKING_SLOTS) is a new
+    action value, not a new endpoint.
+
+
+---------------------------------------------------------------------
+3. ARCHITECTURE AT A GLANCE
+---------------------------------------------------------------------
+
+  Clinic website (any site)
+    |  <script src=".../loader.js" data-tenant="bright-smile">
+    v
+  loader.js  -- draws bubble, opens iframe on click
+    |
+    v
+  Web app (Next.js, Vercel)            middleware.ts sets
+    /embed?tenant=bright-smile  <----  CSP frame-ancestors from
+    ChatWidget + LeadForm               tenant.allowedDomains
+    /admin  (leads, conversations, stats)
+    |
+    |  fetch (CORS only from the web app)
+    v
+  API (NestJS, Render)
+    GET  /v1/tenants/:slug/public
+    POST /v1/chat   -> ChatService -> guardrails -> AgentService
+    POST /v1/leads  -> LeadsService -> Notifier (email or log)
+    GET  /v1/admin/* (x-admin-key)
+    |            |                 |
+    v            v                 v
+  MongoDB     Google Gemini      SMTP email
+  Atlas       (chat model +      (optional)
+  (+ Vector   embedding model)
+   Search)
+
+
+---------------------------------------------------------------------
+4. THE FULL FLOW OF ONE CHAT MESSAGE
+---------------------------------------------------------------------
+
+Step 1. Page load
+  The clinic site loads loader.js. It reads data-tenant, draws the
+  bubble, and after 3 seconds shows a teaser once per session. On the
+  first click it creates the iframe /embed?tenant=<slug>.
+
+Step 2. Widget start
+  ChatWidget calls GET /v1/tenants/:slug/public. This returns only
+  safe public fields: name, bot name, welcome message, quick replies,
+  colour, phone, privacy link, allowed domains. It never returns the
+  staff email or prompt rules.
+  The widget shows the welcome message, which says it is an AI.
+  It restores an existing chat from sessionStorage if there is one.
+
+Step 3. The visitor sends a message
+  The widget calls POST /v1/chat with
+  { tenant, conversationId (optional), message }.
+  The request is validated by a DTO. Unknown fields are rejected.
+  The rate limit is 15 messages per minute per IP.
+
+Step 4. ChatService.handle()  (apps/api/src/chat/chat.service.ts)
+  a) Load the tenant by slug (cached for 60 seconds).
+  b) Find the conversation by id AND tenantId, or create a new one.
+     Because tenantId is in the filter, a conversation id from another
+     clinic simply does not match.
+  c) Load the last 8 messages as history.
+  d) Save the user's message.
+  e) Decide the reply:
+       - checkGuardrails(text)
+           EMERGENCY -> fixed safe reply with the clinic phone and the
+                        tenant's emergencyInfo (999, A&E, NHS 111),
+                        action HANDOFF, staff alert sent.
+           HUMAN     -> "a member of our team will contact you",
+                        action HANDOFF, staff alert sent.
+       - otherwise AgentService.run()
+       - if the agent throws -> apology + clinic phone, action
+         HANDOFF, staff alert. The chat never returns a blank reply.
+  f) Save the assistant reply with its action and "route"
+     (agent, guard:emergency, guard:human or fallback:error).
+  g) Update the conversation: message count, preview, and status
+     "handoff" if needed.
+  h) Return { conversationId, reply, action, sources }.
+
+Step 5. AgentService.run()  (apps/api/src/chat/agent.service.ts)
+  a) Build a search query from the previous user message plus the new
+     one. This helps follow-ups like "and how much is it?".
+  b) RetrievalService finds the 4 closest chunks for this tenant.
+  c) buildSystemPrompt() combines the tenant config, the strict rules
+     and the numbered chunks.
+  d) The LLM provider is called with JSON output, temperature 0.2,
+     and no "thinking" for flash models, for speed and cost.
+  e) The JSON is parsed safely. Code fences are stripped, and if
+     parsing fails the raw text is used with action NONE.
+  f) Only NONE or SHOW_LEAD_FORM are accepted from the model. HANDOFF
+     can only come from code. usedSources numbers are mapped back to
+     chunk headings.
+
+Step 6. Back in the widget
+  The reply is shown. If the action is SHOW_LEAD_FORM or HANDOFF and
+  no lead was sent yet, the lead form appears.
+
+Step 7. Lead form
+  The visitor enters name, phone, and optionally email, preferred time
+  and reason. They must tick the consent box.
+  POST /v1/leads (5 per minute per IP). The API stores the lead with
+  consentAt = now, marks the conversation leadCaptured, and alerts
+  staff by email (or in the log if SMTP is not set).
+
+Step 8. Admin
+  /admin asks for the ADMIN_KEY and shows leads, conversations with
+  their messages, and stats: conversations, leads, handoffs, and
+  replies by route.
+
+Real results from testing this project:
+  "How much is teeth whitening?"   -> action NONE, prices £350 / £550
+  "I'd like to book a check-up"    -> action SHOW_LEAD_FORM
+  "My face is swollen"             -> action HANDOFF (guardrail, no AI)
+
+
+---------------------------------------------------------------------
+5. THE OFFLINE DATA PIPELINE
+---------------------------------------------------------------------
+
+These run once per clinic, or again when its information changes.
+
+npm run seed
+  Reads data/tenants/*/tenant.json and upserts each into the tenants
+  collection.
+
+npm run index:create
+  Creates the Atlas Vector Search index "chunks_vector_index" on the
+  chunks collection:
+    - vector field "embedding", 768 dimensions, cosine similarity
+    - filter field "tenantId", so searches can be limited per clinic
+  It takes about a minute to become READY.
+
+npm run ingest -- bright-smile
+  For every .md file in data/tenants/bright-smile/:
+    1) chunker.ts splits it by #, ## and ### headings, so each FAQ or
+       section stays together. Each chunk starts with its full heading
+       path, for example "Clinic > Prices > Cosmetic treatments".
+       Long sections are split by paragraph at about 1200 characters,
+       with one paragraph of overlap so context is not cut off.
+    2) The embedding provider turns each chunk into a 768-number vector
+       using task type RETRIEVAL_DOCUMENT, in batches of 50. Vectors
+       are L2-normalised, which Gemini needs when the size is reduced.
+    3) All old chunks for the tenant are deleted, then the new ones are
+       inserted. A full replace keeps it simple and consistent.
+  The demo clinic produced 25 chunks.
+
+At question time the query is embedded with task type RETRIEVAL_QUERY.
+Gemini tunes document and query vectors differently, which improves
+search quality.
+
+
+---------------------------------------------------------------------
+6. TECHNICAL IMPLEMENTATION, MODULE BY MODULE
+---------------------------------------------------------------------
+
+API (apps/api/src)
+
+  main.ts
+    Loads .env first, because schemas read retention days on import.
+    Sets "trust proxy" for Render, so rate limits see real visitor IPs.
+    CORS only for CORS_ORIGINS. JSON body limit 20 kb. Global
+    ValidationPipe (whitelist, forbidNonWhitelisted, transform).
+    Global AllExceptionsFilter.
+
+  app.module.ts
+    Wires config, the global rate limit (60 per minute per IP),
+    database, providers, tenants, rag, chat and leads modules.
+
+  config/configuration.ts
+    The only place that reads process.env. Turns env vars into a typed
+    AppConfig with defaults.
+
+  schemas/
+    Tenant, Chunk, Conversation, Message, Lead (see section 7).
+    TTL indexes for retention are defined here.
+
+  database/database.module.ts
+    Global Mongoose connection and model registration.
+
+  providers/
+    llm/llm.interface.ts          LlmProvider interface + token
+    llm/gemini-llm.provider.ts    Gemini chat implementation
+    embeddings/                   EmbeddingProvider + Gemini version
+    notify/notifier.service.ts    email via nodemailer if SMTP_HOST is
+                                  set, otherwise writes an [ALERT] log
+    providers.module.ts           binds tokens to implementations
+
+  tenants/
+    TenantsService.getActiveBySlug() with a 60-second in-memory cache,
+    because the tenant is read on every message.
+    getPublicConfig() returns the safe public subset.
+
+  rag/
+    chunker.ts             Markdown splitter (section 5)
+    ingestion.service.ts   chunk, embed, replace
+    retrieval.service.ts   $vectorSearch with filter { tenantId },
+                           numCandidates = k x 25, returns heading,
+                           text, source and score
+
+  chat/
+    chat.controller.ts     POST /v1/chat, thin web adapter
+    chat.service.ts        orchestration (section 4)
+    agent.service.ts       retrieve, prompt, LLM, parse
+    guardrails.ts          emergency and human regex patterns. Plain
+                           "emergency" is deliberately NOT matched, so
+                           "How much is an emergency appointment?"
+                           still gets a price answer.
+    prompts/system-prompt.ts  prompt built only from tenant config
+    dto/chat-request.dto.ts   request validation
+
+  leads/
+    POST /v1/leads plus the admin endpoints. stats() is the basis of a
+    monthly report for the clinic.
+
+  common/
+    admin-key.guard.ts      checks x-admin-key with a timing-safe
+                            compare. Refuses if ADMIN_KEY is shorter
+                            than 12 characters.
+    all-exceptions.filter.ts  consistent JSON error responses
+
+  scripts/
+    seed.ts, create-vector-index.ts, ingest.ts, eval.ts, and
+    bootstrap-context.ts, which starts Nest without HTTP for scripts.
+
+WEB (apps/web)
+
+  app/page.tsx         fake clinic website that embeds the widget
+                       through loader.js, like a real client would
+  app/embed/page.tsx   the page inside the iframe
+  app/admin/page.tsx   leads, conversations, stats
+  components/ChatWidget.tsx
+                       chat state, quick replies, typing indicator,
+                       sessionStorage wrapped in try/catch (some
+                       browsers block storage in iframes), AI footer
+  components/LeadForm.tsx  lead form with the consent checkbox
+  lib/api.ts           typed fetch client for all endpoints
+  middleware.ts        for /embed only: looks up the tenant's
+                       allowedDomains (cached 5 minutes) and sets
+                       "Content-Security-Policy: frame-ancestors".
+                       Unknown tenant -> 'none'. API unreachable ->
+                       only the app itself.
+  public/loader.js     plain JavaScript, no framework. Bubble,
+                       teaser, lazy iframe, full screen on mobile.
+                       Accepts postMessage only from its own origin.
+  app/globals.css      plain CSS. Prefixes: fd- widget, site- demo
+                       site, admin- admin page. No Tailwind or UI kit,
+                       to keep the widget small.
+
+
+---------------------------------------------------------------------
+7. DATA MODEL
+---------------------------------------------------------------------
+
+  tenants
+    slug, name, botName, phone, emergencyInfo, welcomeMessage,
+    quickReplies, theme, allowedDomains, handoffEmail, privacyUrl,
+    extraRules, features (booking, whatsapp flags), active
+    Kept until changed.
+
+  chunks
+    tenantId, heading, text, source file, embedding (768 numbers,
+    hidden from normal queries)
+    Replaced on each ingest.
+
+  conversations
+    tenantId, channel (web or whatsapp), status (open, handoff,
+    closed), leadCaptured, messageCount, lastMessagePreview
+    Deleted after CHAT_RETENTION_DAYS (30).
+
+  messages
+    conversationId, tenantId, role (user or assistant), content,
+    action, route
+    Deleted after CHAT_RETENTION_DAYS (30).
+
+  leads
+    tenantId, conversationId, name, phone, email, preferredTime,
+    reason, consentAt, status (new, contacted, booked, closed)
+    Deleted after LEAD_RETENTION_DAYS (90).
+
+
+---------------------------------------------------------------------
+8. API ENDPOINTS
+---------------------------------------------------------------------
+
+  GET  /health                                  liveness check
+  GET  /v1/tenants/:slug/public                 widget config
+  POST /v1/chat                                 one chat message
+  POST /v1/leads                                save a lead
+  GET  /v1/admin/leads?tenant=<slug>            admin, needs key
+  GET  /v1/admin/conversations?tenant=<slug>    admin, needs key
+  GET  /v1/admin/conversations/:id/messages?tenant=<slug>
+  GET  /v1/admin/stats?tenant=<slug>&days=30    admin, needs key
+
+Chat response shape:
+  { "conversationId": "...", "reply": "...",
+    "action": "NONE" | "SHOW_LEAD_FORM" | "HANDOFF",
+    "sources": ["heading", ...] }
+
+
+---------------------------------------------------------------------
+9. SECURITY AND COMPLIANCE
+---------------------------------------------------------------------
+
+Security
+  - Every request body has a validation DTO. Unknown fields fail.
+  - Body size limit 20 kb.
+  - Rate limits per IP: 60 per minute overall, 15 for chat, 5 for
+    leads.
+  - CORS allows only the web app. Which clinic sites can embed the
+    widget is controlled separately by frame-ancestors.
+  - Admin endpoints need x-admin-key, compared in constant time.
+  - loader.js ignores messages from any other origin.
+  - No secrets in the web app. Its only variable is
+    NEXT_PUBLIC_API_URL.
+
+Compliance (EU AI Act Article 50, GDPR)
+  - AI disclosure in three places: the welcome message, the widget
+    footer, and the system prompt ("If asked, always say you are an AI
+    assistant"). The emergency reply starts with "I'm an AI
+    assistant".
+  - No medical advice: the prompt forbids diagnosis and medicine
+    advice, and emergencies never reach the AI at all.
+  - Answers only from clinic information. Unknown questions lead to
+    the lead form. Prices are never invented.
+  - Leads require consent: true, stored as consentAt as proof.
+  - Automatic deletion through TTL indexes (30 and 90 days).
+  - The free Gemini tier is for the demo only, with fictional data.
+    Real patient data needs a paid EU provider class.
+
+
+---------------------------------------------------------------------
+10. TESTING
+---------------------------------------------------------------------
+
+  npm run eval
+    Sends every case in apps/api/data/eval/questions.json to the
+    running API. It checks the expected action and that the reply
+    contains expected words (for example "350" or "550" for whitening
+    prices). Each case prints a tick or cross, then a pass count.
+    Add a case here for every new behaviour.
+
+  npm run build
+    Must pass for both apps before a change is done.
+
+  Manual check
+    Open http://localhost:3000, click the bubble, ask questions,
+    submit the lead form, and check it appears on /admin.
+
+
+---------------------------------------------------------------------
+11. LOCAL SETUP NOTES (LESSONS FROM GETTING IT RUNNING)
+---------------------------------------------------------------------
+
+  - On this PC, Node could not do the DNS lookup that a
+    "mongodb+srv://" address needs (error: querySrv ECONNREFUSED).
+    Windows itself could resolve it. The fix was to use Atlas's
+    standard address form instead, which lists the three cluster
+    servers directly:
+      mongodb://USER:PASSWORD@host1:27017,host2:27017,host3:27017/
+      frontdesk_ai_db?ssl=true&authSource=admin&replicaSet=...
+    Do not paste the mongodb+srv template from Atlas back in.
+  - "bad auth : authentication failed" means the database user's
+    password is wrong. It is set under Atlas > Database Access, and
+    special characters like @ must be written as %40.
+  - Keep real secrets only in apps/api/.env, which git ignores.
+    .env.example is committed, so it must contain placeholders only.
+  - Order: seed, index:create (wait for READY), ingest, then dev:api
+    and dev:web in two terminals. API on port 4000, web on 3000.
+  - The API dev server does not reload when .env changes. Restart it.
+
+
+---------------------------------------------------------------------
+12. HOW TO EXTEND IT
+---------------------------------------------------------------------
+
+  Add a new clinic
+    1) Create apps/api/data/tenants/<new-slug>/tenant.json and one or
+       more .md files with the clinic's information.
+    2) npm run seed
+    3) npm run ingest -- <new-slug>
+    4) On the clinic's site:
+       <script src="https://YOUR-WEB-APP/loader.js"
+               data-tenant="<new-slug>" defer></script>
+    5) Add the clinic's website to allowedDomains in tenant.json.
+
+  Add WhatsApp (Phase 2)
+    Write a WhatsApp controller that calls ChatService.handle() with
+    channel "whatsapp". Do not copy any chat logic.
+
+  Add booking (Phase 2)
+    Add a new action value such as SHOW_BOOKING_SLOTS, and plug tools
+    like getFreeSlots into AgentService. The tenant's
+    features.booking flag already exists for switching it on.
+
+  Switch AI provider for real patient data
+    Write a new class that implements LlmProvider (and
+    EmbeddingProvider if needed), and bind it in providers.module.ts.
+    If the embedding size changes, update EMBEDDING_DIMENSIONS, then
+    recreate the index and re-ingest.
+
+  Rules that must stay
+    AI disclosure, consent checkbox, TTL indexes and guardrails must
+    never be removed. Clinic data never goes in code.
